@@ -616,6 +616,17 @@ flatpak_get_have_intel_gpu (void)
   return have_intel;
 }
 
+static gboolean
+flatpak_get_have_nvidia_gpu (void)
+{
+  static int have_nvidia = -1;
+
+  if (have_nvidia == -1)
+    have_nvidia = g_file_test ("/sys/module/nvidia", G_FILE_TEST_EXISTS);
+
+  return have_nvidia;
+}
+
 static const char *
 flatpak_get_gtk_theme (void)
 {
@@ -5988,6 +5999,12 @@ flatpak_extension_matches_reason (const char *extension_id,
         {
           /* Used for Intel VAAPI driver extension */
           if (flatpak_get_have_intel_gpu ())
+            return TRUE;
+        }
+      else if (strcmp (reason, "have-nvidia-gpu") == 0)
+        {
+          /* Used for NVidia VAAPI driver extension */
+          if (flatpak_get_have_nvidia_gpu ())
             return TRUE;
         }
       else if (g_str_has_prefix (reason, "on-xdg-desktop-"))

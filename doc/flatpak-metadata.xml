@@ -893,6 +893,10 @@
                                 <para>Is true if the i915 kernel module is loaded. Added 0.10.1.</para>
                             </varlistentry>
                             <varlistentry>
+                                <term><option>have-nvidia-gpu</option></term>
+                                <para>Is true if the nvidia kernel module is loaded. Added 1.12.3.</para>
+                            </varlistentry>
+                            <varlistentry>
                                 <term><option>on-xdg-desktop-*</option></term>
                                 <para>
                                     Is true if the suffix (case-insensitively) is in the
