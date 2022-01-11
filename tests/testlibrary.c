@@ -39,6 +39,7 @@ static void empty_installation (FlatpakInstallation *inst);
 static void make_test_app (const char *app_repo_name);
 static void update_test_app (void);
 static void update_test_app_extension_version (void);
+static void update_test_app_extension (void);
 static void update_test_runtime (void);
 static void update_repo (const char *update_repo_name);
 static void rename_test_app (const char *update_repo_name);
@@ -1127,6 +1128,63 @@ test_list_remote_refs (void)
       g_assert_null (eol);
       g_assert_null (eol_rebase);
     }
+}
+
+/* Test the xa.noenumerate option on a remote, which should mask non-installed refs */
+static void
+test_list_remote_refs_noenumerate (void)
+{
+  g_autoptr(FlatpakInstallation) inst = NULL;
+  g_autoptr(GError) error = NULL;
+  g_autoptr(GPtrArray) refs = NULL;
+  g_autoptr(FlatpakRemote) remote = NULL;
+  g_autoptr(FlatpakInstalledRef) runtime_ref = NULL;
+  gboolean res;
+
+  inst = flatpak_installation_new_user (NULL, &error);
+  g_assert_no_error (error);
+
+  empty_installation (inst);
+
+  refs = flatpak_installation_list_remote_refs_sync (inst, repo_name, NULL, &error);
+  g_assert_no_error (error);
+  g_assert_nonnull (refs);
+  g_assert_cmpint (refs->len, ==, 4);
+
+  /* Install a runtime */
+  G_GNUC_BEGIN_IGNORE_DEPRECATIONS
+  runtime_ref = flatpak_installation_install (inst,
+                                              repo_name,
+                                              FLATPAK_REF_KIND_RUNTIME,
+                                              "org.test.Platform",
+                                              NULL, "master", NULL, NULL, NULL,
+                                              &error);
+  G_GNUC_END_IGNORE_DEPRECATIONS
+  g_assert_no_error (error);
+  g_assert_true (FLATPAK_IS_INSTALLED_REF (runtime_ref));
+
+  /* Set xa.noenumerate=true */
+  remote = flatpak_installation_get_remote_by_name (inst, repo_name, NULL, &error);
+  g_assert_no_error (error);
+  flatpak_remote_set_noenumerate (remote, TRUE);
+  res = flatpak_installation_modify_remote (inst, remote, NULL, &error);
+  g_assert_no_error (error);
+  g_assert_true (res);
+
+  /* Only the platform should be visible */
+  g_clear_pointer (&refs, g_ptr_array_unref);
+  refs = flatpak_installation_list_remote_refs_sync (inst, repo_name, NULL, &error);
+  g_assert_no_error (error);
+  g_assert_nonnull (refs);
+  g_assert_cmpint (refs->len, ==, 1);
+
+  empty_installation (inst);
+
+  /* Set xa.noenumerate=false */
+  flatpak_remote_set_noenumerate (remote, FALSE);
+  res = flatpak_installation_modify_remote (inst, remote, NULL, &error);
+  g_assert_no_error (error);
+  g_assert_true (res);
 }
 
 static void
@@ -2414,6 +2472,26 @@ rename_test_app (const char *update_repo_name)
 }
 
 static void
+update_test_app_extension (void)
+{
+  g_autofree char *app_plugin_ref = NULL;
+  char *argv[] = { "flatpak", "build-commit-from", "--force",
+                   "--gpg-homedir=", "--gpg-sign=",
+                   "--src-repo=repos/test", "repos/test",
+                   NULL, NULL };
+  g_auto(GStrv) gpgargs = NULL;
+
+  gpgargs = g_strsplit (gpg_args, " ", 0);
+  app_plugin_ref = g_strdup_printf ("runtime/org.test.Hello.Plugin.fun/%s/v1",
+                                    flatpak_get_default_arch ());
+  argv[3] = gpgargs[0];
+  argv[4] = gpgargs[1];
+  argv[7] = app_plugin_ref;
+
+  run_test_subprocess (argv, RUN_TEST_SUBPROCESS_DEFAULT);
+}
+
+static void
 update_test_runtime (void)
 {
   g_autofree char *arg0 = NULL;
@@ -3483,8 +3561,10 @@ test_transaction_flatpakref_remote_creation (void)
   g_autoptr(FlatpakInstallation) user_inst = NULL;
   g_autoptr(FlatpakInstallation) system_inst = NULL;
   g_autoptr(FlatpakTransaction) transaction = NULL;
+  g_autoptr(FlatpakRemote) remote = NULL;
   g_autoptr(GError) error = NULL;
   g_autofree char *s = NULL;
+  g_autofree char *remote_title = NULL;
   g_autoptr(GBytes) data = NULL;
   gboolean res;
 
@@ -3533,6 +3613,13 @@ test_transaction_flatpakref_remote_creation (void)
 
   assert_remote_in_installation (user_inst, "test-without-runtime-repo");
   assert_remote_in_installation (user_inst, "test-runtime-only-repo");
+
+  /* The remote should not use the title of the app as its title */
+  remote = flatpak_installation_get_remote_by_name (user_inst, "test-without-runtime-repo", NULL, &error);
+  g_assert_no_error (error);
+  g_assert_nonnull (remote);
+  remote_title = flatpak_remote_get_title (remote);
+  g_assert_null (remote_title);
 
   empty_installation (user_inst);
   remove_remote_user ("test-without-runtime-repo");
@@ -3758,6 +3845,97 @@ test_transaction_app_runtime_same_remote (void)
   /* Reset things */
   empty_installation (inst);
   remove_remote_user ("aaatest-runtime-only-repo");
+}
+
+/* Test that an installed related ref is updated from its origin remote even if
+ * the thing it's related to comes from a different remote which also provides
+ * the related ref */
+static void
+test_transaction_update_related_from_different_remote (void)
+{
+  g_autoptr(FlatpakInstallation) inst = NULL;
+  g_autoptr(FlatpakTransaction) transaction = NULL;
+  g_autoptr(FlatpakInstalledRef) installed_ref = NULL;
+  g_autoptr(FlatpakRemoteRef) remote_ref = NULL;
+  g_autoptr(GError) error = NULL;
+  g_autofree char *app = NULL;
+  g_autofree char *app_plugin = NULL;
+  const char *app_origin = repo_name;
+  const char *app_plugin_origin = "test-without-runtime-repo";
+  gboolean res;
+
+  app = g_strdup_printf ("app/org.test.Hello/%s/master",
+                         flatpak_get_default_arch ());
+  app_plugin = g_strdup_printf ("runtime/org.test.Hello.Plugin.fun/%s/v1",
+                                flatpak_get_default_arch ());
+
+  inst = flatpak_installation_new_user (NULL, &error);
+  g_assert_no_error (error);
+  g_assert_nonnull (inst);
+
+  empty_installation (inst);
+
+  add_remote_user ("test-without-runtime", NULL);
+
+  /* Drop caches so we find the new remote */
+  flatpak_installation_drop_caches (inst, NULL, &error);
+  g_assert_no_error (error);
+
+  /* Install the plugin only from its remote */
+  transaction = flatpak_transaction_new_for_installation (inst, NULL, &error);
+  g_assert_no_error (error);
+  g_assert_nonnull (transaction);
+
+  res = flatpak_transaction_add_install (transaction, app_plugin_origin, app_plugin, NULL, &error);
+  g_assert_no_error (error);
+  g_assert_true (res);
+
+  res = flatpak_transaction_run (transaction, NULL, &error);
+  g_assert_no_error (error);
+  g_assert_true (res);
+
+  /* Update the related ref in the main repo, so we can check that it's not
+   * updated since we should check for updates in its origin repo */
+  update_test_app_extension ();
+  update_repo ("test");
+
+  /* Install the app from the main remote. The plugin should not be updated */
+  g_clear_object (&transaction);
+  transaction = flatpak_transaction_new_for_installation (inst, NULL, &error);
+  g_assert_no_error (error);
+  g_assert_nonnull (transaction);
+
+  res = flatpak_transaction_add_install (transaction, app_origin, app, NULL, &error);
+  g_assert_no_error (error);
+  g_assert_true (res);
+
+  res = flatpak_transaction_run (transaction, NULL, &error);
+  g_assert_no_error (error);
+  g_assert_true (res);
+
+  /* Check to make sure the plugin is on a different commit locally than in the
+   * main remote */
+  installed_ref = flatpak_installation_get_installed_ref (inst, FLATPAK_REF_KIND_RUNTIME,
+                                                          "org.test.Hello.Plugin.fun",
+                                                          NULL, "v1", NULL, &error);
+  g_assert_no_error (error);
+  g_assert_nonnull (installed_ref);
+
+  remote_ref = flatpak_installation_fetch_remote_ref_sync (inst, app_origin, FLATPAK_REF_KIND_RUNTIME,
+                                                          "org.test.Hello.Plugin.fun",
+                                                          NULL, "v1", NULL, &error);
+  g_assert_no_error (error);
+  g_assert_nonnull (remote_ref);
+
+  g_assert_cmpstr (flatpak_installed_ref_get_origin (installed_ref), !=, app_origin);
+  g_assert_cmpstr (flatpak_ref_get_commit (FLATPAK_REF (installed_ref)), ==,
+                   flatpak_installed_ref_get_latest_commit (installed_ref));
+  g_assert_cmpstr (flatpak_ref_get_commit (FLATPAK_REF (installed_ref)), !=,
+                   flatpak_ref_get_commit (FLATPAK_REF (remote_ref)));
+
+  /* Reset things */
+  empty_installation (inst);
+  remove_remote_user ("test-without-runtime-repo");
 }
 
 typedef struct
@@ -4662,6 +4840,7 @@ main (int argc, char *argv[])
   g_test_add_func ("/library/remote-new", test_remote_new);
   g_test_add_func ("/library/remote-new-from-file", test_remote_new_from_file);
   g_test_add_func ("/library/list-remote-refs", test_list_remote_refs);
+  g_test_add_func ("/library/list-remote-refs-noenumerate", test_list_remote_refs_noenumerate);
   g_test_add_func ("/library/list-remote-related-refs", test_list_remote_related_refs);
   g_test_add_func ("/library/list-remote-related-refs-for-installed", test_list_remote_related_refs_for_installed);
   g_test_add_func ("/library/list-refs", test_list_refs);
@@ -4678,6 +4857,7 @@ main (int argc, char *argv[])
   g_test_add_func ("/library/transaction-deps", test_transaction_deps);
   g_test_add_func ("/library/transaction-install-local", test_transaction_install_local);
   g_test_add_func ("/library/transaction-app-runtime-same-remote", test_transaction_app_runtime_same_remote);
+  g_test_add_func ("/library/transaction-update-related-from-different-remote", test_transaction_update_related_from_different_remote);
   g_test_add_func ("/library/instance", test_instance);
   g_test_add_func ("/library/update-subpaths", test_update_subpaths);
   g_test_add_func ("/library/overrides", test_overrides);

@@ -8560,6 +8560,7 @@ flatpak_dir_deploy_install (FlatpakDir        *self,
                             const char       **subpaths,
                             const char       **previous_ids,
                             gboolean           reinstall,
+                            gboolean           pin_on_deploy,
                             GCancellable      *cancellable,
                             GError           **error)
 {
@@ -8655,6 +8656,14 @@ flatpak_dir_deploy_install (FlatpakDir        *self,
   flatpak_dir_cleanup_removed (self, cancellable, NULL);
 
   if (!flatpak_dir_mark_changed (self, error))
+    goto out;
+
+  /* Pin runtimes that are installed explicitly rather than pulled as
+   * dependencies so they are not automatically removed. */
+  if (pin_on_deploy &&
+      !flatpak_dir_config_append_pattern (self, "pinned",
+                                          flatpak_decomposed_get_ref (ref),
+                                          TRUE, NULL, error))
     goto out;
 
   ret = TRUE;
@@ -9061,6 +9070,7 @@ flatpak_dir_install (FlatpakDir          *self,
                      gboolean             no_static_deltas,
                      gboolean             reinstall,
                      gboolean             app_hint,
+                     gboolean             pin_on_deploy,
                      FlatpakRemoteState  *state,
                      FlatpakDecomposed   *ref,
                      const char          *opt_commit,
@@ -9270,6 +9280,9 @@ flatpak_dir_install (FlatpakDir          *self,
       if (app_hint)
         helper_flags |= FLATPAK_HELPER_DEPLOY_FLAGS_APP_HINT;
 
+      if (pin_on_deploy)
+        helper_flags |= FLATPAK_HELPER_DEPLOY_FLAGS_UPDATE_PINNED;
+
       helper_flags |= FLATPAK_HELPER_DEPLOY_FLAGS_INSTALL_HINT;
 
       if (!flatpak_dir_system_helper_call_deploy (self,
@@ -9299,7 +9312,8 @@ flatpak_dir_install (FlatpakDir          *self,
   if (!no_deploy)
     {
       if (!flatpak_dir_deploy_install (self, ref, state->remote_name, opt_subpaths,
-                                       opt_previous_ids, reinstall, cancellable, error))
+                                       opt_previous_ids, reinstall, pin_on_deploy,
+                                       cancellable, error))
         return FALSE;
     }
 
@@ -9576,7 +9590,7 @@ flatpak_dir_install_bundle (FlatpakDir         *self,
     }
   else
     {
-      if (!flatpak_dir_deploy_install (self, ref, remote, NULL, NULL, FALSE, cancellable, error))
+      if (!flatpak_dir_deploy_install (self, ref, remote, NULL, NULL, FALSE, FALSE, cancellable, error))
         return FALSE;
     }
 
@@ -12310,7 +12324,11 @@ flatpak_dir_list_all_remote_refs (FlatpakDir         *self,
         {
           summary = var_summary_from_gvariant (subsummary);
           ref_map = var_summary_get_ref_map (summary);
-          populate_hash_table_from_refs_map (ret_all_refs, NULL, ref_map, NULL, state);
+
+          /* NOTE: collection id is NULL here not state->collection_id, see the
+           * note on flatpak_decomposed_get_collection_id()
+           */
+          populate_hash_table_from_refs_map (ret_all_refs, NULL, ref_map, NULL /* collection id */, state);
         }
     }
   else if (state->summary != NULL)
@@ -13734,14 +13752,12 @@ parse_ref_file (GKeyFile *keyfile,
                 char    **name_out,
                 char    **branch_out,
                 char    **url_out,
-                char    **title_out,
                 GBytes  **gpg_data_out,
                 gboolean *is_runtime_out,
                 char    **collection_id_out,
                 GError  **error)
 {
   g_autofree char *url = NULL;
-  g_autofree char *title = NULL;
   g_autofree char *name = NULL;
   g_autofree char *branch = NULL;
   g_autofree char *version = NULL;
@@ -13753,7 +13769,6 @@ parse_ref_file (GKeyFile *keyfile,
   *name_out = NULL;
   *branch_out = NULL;
   *url_out = NULL;
-  *title_out = NULL;
   *gpg_data_out = NULL;
   *is_runtime_out = FALSE;
 
@@ -13779,9 +13794,6 @@ parse_ref_file (GKeyFile *keyfile,
                                   FLATPAK_REF_BRANCH_KEY, NULL);
   if (branch == NULL)
     branch = g_strdup ("master");
-
-  title = g_key_file_get_string (keyfile, FLATPAK_REF_GROUP,
-                                 FLATPAK_REF_TITLE_KEY, NULL);
 
   is_runtime = g_key_file_get_boolean (keyfile, FLATPAK_REF_GROUP,
                                        FLATPAK_REF_IS_RUNTIME_KEY, NULL);
@@ -13820,7 +13832,6 @@ parse_ref_file (GKeyFile *keyfile,
   *name_out = g_steal_pointer (&name);
   *branch_out = g_steal_pointer (&branch);
   *url_out = g_steal_pointer (&url);
-  *title_out = g_steal_pointer (&title);
   *gpg_data_out = g_steal_pointer (&gpg_data);
   *is_runtime_out = is_runtime;
   *collection_id_out = g_steal_pointer (&collection_id);
@@ -13841,14 +13852,13 @@ flatpak_dir_create_remote_for_ref_file (FlatpakDir         *self,
   g_autofree char *name = NULL;
   g_autofree char *branch = NULL;
   g_autofree char *url = NULL;
-  g_autofree char *title = NULL;
   g_autofree char *remote = NULL;
   gboolean is_runtime = FALSE;
   g_autofree char *collection_id = NULL;
   g_autoptr(GFile) deploy_dir = NULL;
   g_autoptr(FlatpakDecomposed) ref = NULL;
 
-  if (!parse_ref_file (keyfile, &name, &branch, &url, &title, &gpg_data, &is_runtime, &collection_id, error))
+  if (!parse_ref_file (keyfile, &name, &branch, &url, &gpg_data, &is_runtime, &collection_id, error))
     return FALSE;
 
   ref = flatpak_decomposed_new_from_parts (is_runtime ? FLATPAK_KINDS_RUNTIME : FLATPAK_KINDS_APP,
@@ -13871,7 +13881,8 @@ flatpak_dir_create_remote_for_ref_file (FlatpakDir         *self,
 
   if (remote == NULL)
     {
-      remote = flatpak_dir_create_origin_remote (self, url, name, title, flatpak_decomposed_get_ref (ref),
+      /* title is NULL because the title from the ref file is the title of the app not the remote */
+      remote = flatpak_dir_create_origin_remote (self, url, name, NULL, flatpak_decomposed_get_ref (ref),
                                                  gpg_data, collection_id, NULL, NULL, error);
       if (remote == NULL)
         return FALSE;
@@ -14390,7 +14401,13 @@ flatpak_dir_list_remote_refs (FlatpakDir         *self,
       while (g_hash_table_iter_next (&hash_iter, &key, NULL))
         {
           const char *refspec = key;
-          g_autoptr(FlatpakDecomposed) d = flatpak_decomposed_new_from_refspec (refspec, NULL);
+          g_autofree char *ref = NULL;
+          g_autoptr(FlatpakDecomposed) d = NULL;
+
+          if (!ostree_parse_refspec (refspec, NULL, &ref, error))
+            return FALSE;
+
+          d = flatpak_decomposed_new_from_ref (ref, NULL);
           if (d)
             g_hash_table_insert (decomposed_local_refs, g_steal_pointer (&d), NULL);
         }
@@ -14707,6 +14724,7 @@ flatpak_dir_update_remote_configuration (FlatpakDir   *self,
 void
 flatpak_related_free (FlatpakRelated *self)
 {
+  g_free (self->remote);
   flatpak_decomposed_unref (self->ref);
   g_free (self->commit);
   g_strfreev (self->subpaths);
@@ -14716,6 +14734,7 @@ flatpak_related_free (FlatpakRelated *self)
 static void
 add_related (FlatpakDir        *self,
              GPtrArray         *related,
+             const char        *remote,
              const char        *extension,
              FlatpakDecomposed *extension_ref,
              const char        *checksum,
@@ -14745,7 +14764,12 @@ add_related (FlatpakDir        *self,
   branch = flatpak_decomposed_dup_branch (extension_ref);
 
   if (deploy_data)
-    old_subpaths = flatpak_deploy_data_get_subpaths (deploy_data);
+    {
+      old_subpaths = flatpak_deploy_data_get_subpaths (deploy_data);
+      /* If the extension is installed already, its origin overrides the remote
+       * that would otherwise be used */
+      remote = flatpak_deploy_data_get_origin (deploy_data);
+    }
 
   /* Only respect no-autodownload/download-if for uninstalled refs, we
      always want to update if you manually installed something */
@@ -14791,6 +14815,7 @@ add_related (FlatpakDir        *self,
   subpaths = flatpak_subpaths_merge ((char **) old_subpaths, extra_subpaths);
 
   rel = g_new0 (FlatpakRelated, 1);
+  rel->remote = g_strdup (remote);
   rel->ref = flatpak_decomposed_ref (extension_ref);
   rel->commit = g_strdup (checksum);
   rel->subpaths = g_steal_pointer (&subpaths);
@@ -15004,7 +15029,7 @@ flatpak_dir_find_remote_related_for_metadata (FlatpakDir         *self,
               if (flatpak_remote_state_lookup_ref (state, flatpak_decomposed_get_ref (extension_ref), &checksum, NULL, NULL, NULL, NULL))
                 {
                   if (flatpak_filters_allow_ref (NULL, masked, flatpak_decomposed_get_ref (extension_ref)))
-                    add_related (self, related, extension, extension_ref, checksum,
+                    add_related (self, related, state->remote_name, extension, extension_ref, checksum,
                                  no_autodownload, download_if, autoprune_unless, autodelete, locale_subset);
                 }
               else if (subdirectories)
@@ -15018,7 +15043,7 @@ flatpak_dir_find_remote_related_for_metadata (FlatpakDir         *self,
                       if (flatpak_remote_state_lookup_ref (state, flatpak_decomposed_get_ref (subref_ref),
                                                            &subref_checksum, NULL, NULL, NULL, NULL) &&
                           flatpak_filters_allow_ref (NULL, masked,  flatpak_decomposed_get_ref (subref_ref)))
-                        add_related (self, related, extension, subref_ref, subref_checksum,
+                        add_related (self, related, state->remote_name, extension, subref_ref, subref_checksum,
                                      no_autodownload, download_if, autoprune_unless, autodelete, locale_subset);
                     }
                 }
@@ -15257,7 +15282,7 @@ flatpak_dir_find_local_related_for_metadata (FlatpakDir        *self,
                                             NULL,
                                             NULL))
                 {
-                  add_related (self, related, extension, extension_ref,
+                  add_related (self, related, remote_name, extension, extension_ref,
                                checksum, no_autodownload, download_if, autoprune_unless, autodelete, locale_subset);
                 }
               else if ((deploy_data = flatpak_dir_get_deploy_data (self, extension_ref,
@@ -15270,8 +15295,10 @@ flatpak_dir_find_local_related_for_metadata (FlatpakDir        *self,
                    * --force
                    */
                   checksum = g_strdup (flatpak_deploy_data_get_commit (deploy_data));
-                  add_related (self, related, extension, extension_ref,
-                               checksum, no_autodownload, download_if, autoprune_unless, autodelete, locale_subset);
+                  add_related (self, related,
+                               flatpak_deploy_data_get_origin (deploy_data),
+                               extension, extension_ref, checksum,
+                               no_autodownload, download_if, autoprune_unless, autodelete, locale_subset);
                 }
               else if (subdirectories)
                 {
@@ -15291,7 +15318,7 @@ flatpak_dir_find_local_related_for_metadata (FlatpakDir        *self,
                                                     NULL,
                                                     NULL))
                         {
-                          add_related (self, related, extension, match, match_checksum,
+                          add_related (self, related, remote_name, extension, match, match_checksum,
                                        no_autodownload, download_if, autoprune_unless, autodelete, locale_subset);
                         }
                       else if ((match_deploy_data = flatpak_dir_get_deploy_data (self, match,
@@ -15303,7 +15330,9 @@ flatpak_dir_find_local_related_for_metadata (FlatpakDir        *self,
                            * not have a ref in the repo
                            */
                           match_checksum = g_strdup (flatpak_deploy_data_get_commit (match_deploy_data));
-                          add_related (self, related, extension, match, match_checksum,
+                          add_related (self, related,
+                                       flatpak_deploy_data_get_origin (match_deploy_data),
+                                       extension, match, match_checksum,
                                        no_autodownload, download_if, autoprune_unless, autodelete, locale_subset);
                         }
                     }
